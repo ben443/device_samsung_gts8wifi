@@ -1,0 +1,90 @@
+# Copyright (c) 2017-2018, The Linux Foundation. All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#     * Redistributions of source code must retain the above copyright
+#       notice, this list of conditions and the following disclaimer.
+#     * Redistributions in binary form must reproduce the above copyright
+#       notice, this list of conditions and the following disclaimer in the
+#       documentation and/or other materials provided with the distribution.
+#     * Neither the name of The Linux Foundation nor
+#       the names of its contributors may be used to endorse or promote
+#       products derived from this software without specific prior written
+#       permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NON-INFRINGEMENT ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
+# CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+# EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+# PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
+# OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+# WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
+# OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
+# ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+
+import /init.recovery.qcom_decrypt.rc
+
+on init
+    setprop sys.usb.controller a600000.dwc3
+    setprop sys.usb.configfs 1
+
+    # unlink /efs > /mnt/vendor/efs
+    rm /efs
+    mkdir /efs
+    mkdir /sec_efs
+
+    # to cut charging battery path
+    write /sys/class/power_supply/battery/siop_level 0
+
+on fs
+    wait /dev/block/platform/soc/${ro.boot.bootdevice}
+    symlink /dev/block/platform/soc/${ro.boot.bootdevice} /dev/block/bootdevice
+
+    export ANDROID_ROOT /system_root
+
+    # Mount modem firmware so the skeymint TrustZone app can be located early.
+    mkdir /vendor/firmware_mnt 0771 root root
+    mount vfat /dev/block/bootdevice/by-name/apnhlos /vendor/firmware_mnt ro
+
+    # Mount EFS read-write so Samsung keymint can create gakkeybox on first use.
+    mkdir /mnt/vendor/efs 0771 root root
+    mount ext4 /dev/block/bootdevice/by-name/efs /mnt/vendor/efs rw
+
+on boot
+    setprop ro.boot.vbmeta.avb_version 1.2
+    setprop ro.boot.avb_version 1.2
+    setprop ro.hardware.gatekeeper mdfpp
+
+    start keymint-samsung
+    start gatekeeper-samsung
+    setprop vendor.sys.listeners.registered true
+    setprop sys.listeners.registered true
+
+# Samsung KeyMint AIDL service
+service keymint-samsung /vendor/bin/hw/android.hardware.security.keymint-service
+    user root
+    group root
+    setenv LD_LIBRARY_PATH /vendor/lib64:/system/lib64
+    disabled
+    oneshot
+    seclabel u:r:recovery:s0
+
+# Samsung Gatekeeper HIDL service
+service gatekeeper-samsung /vendor/bin/hw/android.hardware.gatekeeper@1.0-service
+    user root
+    group root
+    setenv LD_LIBRARY_PATH /vendor/lib64:/vendor/lib64/hw:/system/lib64
+    disabled
+    seclabel u:r:recovery:s0
+
+# Samsung Hermes weaver daemon
+service hermesd /vendor/bin/hermesd /data/vendor/gatekeeper
+    user root
+    group root system
+    socket hermes_secnvm stream 660 system system
+    setenv LD_LIBRARY_PATH /vendor/lib64/hermes:/vendor/lib64:/system/lib64
+    disabled
+    seclabel u:r:recovery:s0

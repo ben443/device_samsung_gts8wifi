@@ -1,0 +1,287 @@
+diff --git a/Decrypt.cpp b/Decrypt.cpp
+index d9f034b..4cbcb8e 100755
+--- a/Decrypt.cpp
++++ b/Decrypt.cpp
+@@ -356,20 +356,25 @@ struct weaver_data_struct {
+  * https://android.googlesource.com/platform/frameworks/base/+/android-8.0.0_r23/services/core/java/com/android/server/locksettings/SyntheticPasswordManager.java#768 */
+ bool Get_Weaver_Data(const std::string& spblob_path, const std::string& handle_str, weaver_data_struct *wd) {
+ 	printf("Get_Weaver_Data\n");
+-	std::string weaver_file = spblob_path + handle_str + ".weaver";
++	// Use Get_Spblob_Data so the leading-zero handle fallback applies: Samsung/AOSP
++	// zero-pad the on-disk handle to 16 hex chars, but getHandle() drops leading zeros.
+ 	std::string weaver_data;
+-	if (!android::base::ReadFileToString(weaver_file, &weaver_data)) {
+-		printf("Failed to read '%s'\n", weaver_file.c_str());
++	if (!Get_Spblob_Data(spblob_path, handle_str, ".weaver", "weaver", &weaver_data)) {
++		printf("Failed to read weaver file\n");
++		return false;
++	}
++	if (weaver_data.size() < 5) {
++		printf("weaver data too short: %zu\n", weaver_data.size());
+ 		return false;
+ 	}
+ 	// output_hex(weaver_data.data(), weaver_data.size());printf("\n");
+ 	const unsigned char* byteptr = (const unsigned char*)weaver_data.data();
+-	wd->version = *byteptr;
+-	// printf("weaver version %i\n", wd->version);
+-	const int* intptr = (const int*)weaver_data.data() + sizeof(unsigned char);
+-	wd->slot = *intptr;
+-	//endianswap(&wd->slot); not needed
+-	// printf("weaver slot %i\n", wd->slot);
++	wd->version = byteptr[0];
++	// The slot is a big-endian int32 at offset 1 (Java ByteBuffer.putInt is big-endian).
++	// The original code did (const int*)data + sizeof(unsigned char), which reads at
++	// byte offset 4 (out of bounds for the 5-byte file) and only worked for slot 0.
++	wd->slot = ((int)byteptr[1] << 24) | ((int)byteptr[2] << 16) | ((int)byteptr[3] << 8) | (int)byteptr[4];
++	printf("weaver version %i slot %i\n", wd->version, wd->slot);
+ 	return true;
+ }
+ 
+@@ -603,9 +608,14 @@ userid_t fakeUid(const userid_t uid) {
+ 
+ bool Is_Weaver(const std::string& spblob_path, const std::string& handle_str) {
+ 	printf("Is_Weaver\n");
+-	std::string weaver_file = spblob_path + handle_str + ".weaver";
+ 	struct stat st;
+-	if (stat(weaver_file.c_str(), &st) == 0)
++	// Try the handle as-is and with leading zeros: getHandle() drops leading zeros
++	// but the on-disk .weaver filename is zero-padded to 16 hex chars.
++	if (stat((spblob_path + handle_str + ".weaver").c_str(), &st) == 0)
++		return true;
++	if (stat((spblob_path + "0" + handle_str + ".weaver").c_str(), &st) == 0)
++		return true;
++	if (stat((spblob_path + "00" + handle_str + ".weaver").c_str(), &st) == 0)
+ 		return true;
+ 	return false;
+ }
+@@ -683,6 +693,16 @@ bool Decrypt_User_Synth_Pass(const userid_t user_id, const std::string& Password
+ 	// output_hex(&password_token[0], PASSWORD_TOKEN_SIZE);printf("\n");
+ 	if (Is_Weaver(spblob_path, handle_str)) {
+ 		printf("using weaver\n");
++		// Samsung Knox Vault: start the hermesd weaver daemon on demand. It talks to
++		// the eSE (/dev/k250a) and serves android.hardware.weaver@1.0::IWeaver. We start
++		// it here (not at boot) because it needs /data/vendor/gatekeeper state, and /data
++		// is only mounted after the metadata layer is decrypted. hermesd registers with
++		// hwservicemanager (weaver is in the framework VINTF manifest), then getService()
++		// below picks it up. No-op if it is already running.
++		printf("starting hermesd weaver daemon\n");
++		property_set("ctl.start", "hermesd");
++		// give hermesd time to power on the eSE and registerAsService before getService()
++		sleep(3);
+ 		// BEGIN PIXEL 2 WEAVER
+ 		// Get the weaver data from the .weaver file which tells us which slot to use when we ask weaver for the escrowed key
+ 		// https://android.googlesource.com/platform/frameworks/base/+/android-8.0.0_r23/services/core/java/com/android/server/locksettings/SyntheticPasswordManager.java#768
+diff --git a/FsCrypt.cpp b/FsCrypt.cpp
+index 7505e56..e546d5c 100644
+--- a/FsCrypt.cpp
++++ b/FsCrypt.cpp
+@@ -487,13 +487,21 @@ install:
+     LOG(INFO) << "Wrote system DE key reference to:" << ref_filename;
+ 
+     KeyBuffer per_boot_key;
+-    if (!generateStorageKey(makeGen(options), &per_boot_key)) return false;
+-    EncryptionPolicy per_boot_policy;
+-    if (!install_storage_key(DATA_MNT_POINT, options, per_boot_key, &per_boot_policy)) return false;
+-    std::string per_boot_ref_filename = std::string("/data") + fscrypt_key_per_boot_ref;
+-    if (!android::vold::writeStringToFile(per_boot_policy.key_raw_ref, per_boot_ref_filename))
+-        return false;
+-    LOG(INFO) << "Wrote per boot key reference to:" << per_boot_ref_filename;
++    if (!generateStorageKey(makeGen(options), &per_boot_key)) {
++        // Samsung skeymint cannot generate new keys in recovery (EFS/DAK not available).
++        // The per-boot key is a transient key used for lock-screen notification encryption
++        // and is regenerated on every normal boot. Skipping it is safe in recovery since
++        // no CE per-boot-encrypted data is accessed during the decryption flow.
++        LOG(WARNING) << "generateStorageKey per-boot failed; skipping in recovery context";
++    } else {
++        EncryptionPolicy per_boot_policy;
++        if (!install_storage_key(DATA_MNT_POINT, options, per_boot_key, &per_boot_policy))
++            return false;
++        std::string per_boot_ref_filename = std::string("/data") + fscrypt_key_per_boot_ref;
++        if (!android::vold::writeStringToFile(per_boot_policy.key_raw_ref, per_boot_ref_filename))
++            return false;
++        LOG(INFO) << "Wrote per boot key reference to:" << per_boot_ref_filename;
++    }
+ 
+     return true;
+ }
+@@ -501,7 +509,11 @@ install:
+ bool fscrypt_init_user0() {
+     LOG(INFO) << "fscrypt_init_user0";
+     if (fscrypt_is_native()) {
+-        if (!prepare_dir(user_key_dir, 0700, AID_ROOT, AID_ROOT)) return false;
++        if (!prepare_dir(user_key_dir, 0700, AID_ROOT, AID_ROOT)) {
++            printf("fscrypt_init_user0: prepare_dir(%s) FAILED errno=%d\n",
++                   user_key_dir.c_str(), errno);
++            return false;
++        }
+         if (!prepare_dir(user_key_dir + "/ce", 0700, AID_ROOT, AID_ROOT)) return false;
+         if (!prepare_dir(user_key_dir + "/de", 0700, AID_ROOT, AID_ROOT)) return false;
+         if (!android::vold::pathExists(get_de_key_path(0))) {
+diff --git a/KeyStorage.cpp b/KeyStorage.cpp
+index 51fc4f6..feb12c4 100644
+--- a/KeyStorage.cpp
++++ b/KeyStorage.cpp
+@@ -366,29 +366,24 @@ static KeymasterOperation BeginKeymasterOp(Keymaster& keymaster, const std::stri
+         // DeleteUpgradedKey(keymaster, upgraded_blob_file);
+     if (!readFileToString(blob_file, &blob)) return KeymasterOperation();
+     // }
++    printf("KS: calling keymaster.begin blob_file=%s\n", blob_file.c_str());
+     auto opHandle = keymaster.begin(blob, inParams, outParams);
++    printf("KS: keymaster.begin returned valid=%d errCode=%d upgraded=%d\n",
++           (bool)opHandle, (int)opHandle.getErrorCode(),
++           opHandle.getUpgradedBlob().has_value());
+     if (!opHandle) return opHandle;
+ 
+-    // If key blob wasn't upgraded, nothing left to do.
+-    // if (!opHandle.getUpgradedBlob()) return opHandle;
+-
+-    // if (already_upgraded) {
+-    //     LOG(ERROR) << "Unexpected case; already-upgraded key " << upgraded_blob_file
+-    //                << " still requires upgrade";
+-    //     return KeymasterOperation();
+-    // }
+-    LOG(INFO) << "Upgrading key: " << blob_file;
+-    
+-    if (!writeStringToFile(*opHandle.getUpgradedBlob(), upgraded_blob_file))
+-        return KeymasterOperation();
+-    // if (cp_needsCheckpoint()) {
+-    //     LOG(INFO) << "Wrote upgraded key to " << upgraded_blob_file
+-    //               << "; delaying commit due to checkpoint";
+-    //     ScheduleKeyCommit(dir);
+-    // } else {
+-    //     if (!CommitUpgradedKey(keymaster, dir)) return KeymasterOperation();
+-    //     LOG(INFO) << "Key upgraded: " << blob_file;
+-    // }
++    if (opHandle.getUpgradedBlob().has_value()) {
++        LOG(INFO) << "Upgrading key: " << blob_file;
++        printf("KS: writing upgraded blob to %s\n", upgraded_blob_file.c_str());
++        if (!writeStringToFile(*opHandle.getUpgradedBlob(), upgraded_blob_file)) {
++            printf("KS: writeStringToFile FAILED\n");
++            return KeymasterOperation();
++        }
++        printf("KS: upgraded blob written OK\n");
++    } else {
++        printf("KS: no upgraded blob, returning opHandle directly\n");
++    }
+     return opHandle;
+ }
+ 
+@@ -423,13 +418,27 @@ static bool decryptWithKeymasterKey(Keymaster& keymaster, const std::string& dir
+                                     const std::string& ciphertext, KeyBuffer* message) {
+     const std::string nonce = ciphertext.substr(0, GCM_NONCE_BYTES);
+     auto bodyAndMac = ciphertext.substr(GCM_NONCE_BYTES);
++    printf("KS: decryptWithKey nonce.size=%zu body.size=%zu\n", nonce.size(), bodyAndMac.size());
+     auto opParams = km::AuthorizationSetBuilder()
+                             .Authorization(km::TAG_NONCE, nonce)
+                             .Authorization(km::TAG_PURPOSE, km::KeyPurpose::DECRYPT);
+     auto opHandle = BeginKeymasterOp(keymaster, dir, keyParams, opParams, nullptr);
+-    if (!opHandle) return false;
+-    if (!opHandle.updateCompletely(bodyAndMac, message)) return false;
+-    if (!opHandle.finish(nullptr)) return false;
++    printf("KS: BeginKeymasterOp returned valid=%d\n", (bool)opHandle);
++    if (!opHandle) {
++        printf("KS: BeginKeymasterOp FAILED errCode=%d\n", (int)opHandle.getErrorCode());
++        return false;
++    }
++    printf("KS: calling updateCompletely bodyAndMac.size=%zu\n", bodyAndMac.size());
++    if (!opHandle.updateCompletely(bodyAndMac, message)) {
++        printf("KS: updateCompletely FAILED\n");
++        return false;
++    }
++    printf("KS: updateCompletely OK, calling finish\n");
++    if (!opHandle.finish(nullptr)) {
++        printf("KS: finish FAILED\n");
++        return false;
++    }
++    printf("KS: finish OK\n");
+     return true;
+ }
+ 
+@@ -621,11 +630,19 @@ bool retrieveKey(const std::string& dir, const KeyAuthentication& auth, KeyBuffe
+     std::string encryptedMessage;
+     if (!readFileToString(dir + "/" + kFn_encrypted_key, &encryptedMessage)) return false;
+     if (auth.usesKeymaster()) {
++        printf("KS: constructing Keymaster object\n");
+         Keymaster keymaster;
+-        if (!keymaster) return false;
++        if (!keymaster) {
++            printf("KS: Keymaster object INVALID (no security level from keystore2)\n");
++            return false;
++        }
++        printf("KS: Keymaster OK, calling decryptWithKeymasterKey\n");
+         km::AuthorizationSet keyParams = beginParams(appId);
+-        if (!decryptWithKeymasterKey(keymaster, dir, keyParams, encryptedMessage, key))
++        if (!decryptWithKeymasterKey(keymaster, dir, keyParams, encryptedMessage, key)) {
++            printf("KS: decryptWithKeymasterKey FAILED\n");
+             return false;
++        }
++        printf("KS: decryptWithKeymasterKey OK key.size=%zu\n", key->size());
+     } else {
+         if (!decryptWithoutKeymaster(appId, encryptedMessage, key)) return false;
+     }
+diff --git a/MetadataCrypt.cpp b/MetadataCrypt.cpp
+index dd6d880..1ce4853 100644
+--- a/MetadataCrypt.cpp
++++ b/MetadataCrypt.cpp
+@@ -145,10 +145,13 @@ static bool create_crypto_blk_dev(const std::string& dm_name, const std::string&
+ 
+     KeyBuffer module_key;
+     if (options.use_hw_wrapped_key) {
++        printf("MCrypt: calling exportWrappedStorageKey key.size=%zu\n", key.size());
+         if (!exportWrappedStorageKey(key, &module_key)) {
++            printf("MCrypt: exportWrappedStorageKey FAILED\n");
+             LOG(ERROR) << "Failed to get ephemeral wrapped key";
+             return false;
+         }
++        printf("MCrypt: exportWrappedStorageKey OK module_key.size=%zu\n", module_key.size());
+     } else {
+         module_key = key;
+     }
+@@ -252,6 +255,9 @@ bool fscrypt_mount_metadata_encrypted(const std::string& blk_device, const std::
+         }
+         options_format_version = options.version;
+     }
++    printf("MCrypt: options_format_version=%u enc_opts=%s meta_enc=%s\n",
++           options_format_version, data_rec->encryption_options.c_str(),
++           data_rec->metadata_encryption.c_str());
+ 
+     CryptoOptions options;
+     if (options_format_version == 1) {
+@@ -270,20 +276,34 @@ bool fscrypt_mount_metadata_encrypted(const std::string& blk_device, const std::
+             return false;
+         }
+     } else if (options_format_version == 2) {
+-        if (!parse_options(data_rec->metadata_encryption, &options)) return false;
++        if (!parse_options(data_rec->metadata_encryption, &options)) {
++            printf("MCrypt: parse_options FAILED for: %s\n", data_rec->metadata_encryption.c_str());
++            return false;
++        }
+     } else {
+         LOG(ERROR) << "Unknown options_format_version: " << options_format_version;
+         return false;
+     }
++    printf("MCrypt: use_hw_wrapped_key=%d cipher=%s\n", options.use_hw_wrapped_key,
++           options.cipher.get_kernel_name() ? options.cipher.get_kernel_name() : "null");
+ 
+     auto gen = needs_encrypt ? makeGen(options) : neverGen();
+     KeyBuffer key;
+-    if (!read_key(data_rec->metadata_key_dir, gen, &key)) return false;
++    printf("MCrypt: calling read_key dir=%s\n", data_rec->metadata_key_dir.c_str());
++    if (!read_key(data_rec->metadata_key_dir, gen, &key)) {
++        printf("MCrypt: read_key FAILED\n");
++        return false;
++    }
++    printf("MCrypt: read_key OK key.size=%zu\n", key.size());
+ 
+     std::string crypto_blkdev;
+     uint64_t nr_sec;
+-    if (!create_crypto_blk_dev(kDmNameUserdata, blk_device, key, options, &crypto_blkdev, &nr_sec))
++    printf("MCrypt: calling create_crypto_blk_dev\n");
++    if (!create_crypto_blk_dev(kDmNameUserdata, blk_device, key, options, &crypto_blkdev, &nr_sec)) {
++        printf("MCrypt: create_crypto_blk_dev FAILED\n");
+         return false;
++    }
++    printf("MCrypt: create_crypto_blk_dev OK blkdev=%s\n", crypto_blkdev.c_str());
+ 
+     if (needs_encrypt) {
+         if (should_format) {

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<manifest version="1.0" type="framework">
+    <hal format="aidl">
+        <name>android.system.keystore2</name>
+        <interface>
+            <name>IKeystoreService</name>
+            <instance>default</instance>
+        </interface>
+    </hal>
+    <!-- Samsung Knox Vault weaver (served by hermesd) for PIN/CE-key decryption.
+         Declared in the FRAMEWORK manifest, not a device manifest: a /vendor
+         device manifest would switch servicemanager into VINTF-enforcing mode and
+         make Samsung keymint's @VintfStability addService abort (breaking metadata
+         decrypt). hwservicemanager's getTransport checks the framework manifest too,
+         so this is enough for hermesd to registerAsService IWeaver. -->
+    <hal format="hidl">
+        <name>android.hardware.weaver</name>
+        <transport>hwbinder</transport>
+        <fqname>@1.0::IWeaver/default</fqname>
+    </hal>
+</manifest>
